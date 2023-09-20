@@ -1,0 +1,169 @@
+---
+title: "RR1 data activity"
+author: "Aida Parnia"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Importing data
+
+```{r}
+# adding the needed libraries for R
+library(tidyverse) # for data a cleaning
+library(srvyr) # to apply weights
+library(kableExtra) # for better tables 
+library(modelsummary) # for easier regression tables
+```
+Reading the data into R. For replication change to your own file location.
+
+```{r}
+# Reading data
+census <- read_csv("/Users/Oliver/Library/CloudStorage/Dropbox/Sociology/CAnD3/CAND3 Data/Census 2016/pumf-98M0001-E-2016-individuals_F1.csv") # Change path address to your own. 
+```
+## Cleaning data
+
+### Defining the variables and lables 
+
+
+**Visible minority** detailed variable called VisMin. 
+Defining the categories based on the codebook. 
+
+```{r}
+
+census <- census %>% 
+  mutate(VisMin_cat = case_when(
+    VisMin == 1 ~ "South Asian",
+    VisMin == 2 ~ "Chinese",
+    VisMin == 3 ~ "Black",
+    VisMin == 4 ~ "Filipino",
+    VisMin == 5 ~ "Latin American",
+    VisMin == 6 ~ "Arab",
+    VisMin > 6 & VisMin < 13 ~ "Other",
+    VisMin == 13 ~ "White",
+    VisMin == 88 ~ NA_character_
+  ))
+
+```
+
+Other variables: Sex, generation status, Age groups, Marital status 
+
+```{r}
+# sex
+census <- census %>% mutate(Sex_cat = case_when(
+  Sex == 1 ~ "Female",
+  Sex == 2 ~ "Male"
+))
+
+# generation status
+census <- census %>% mutate(GENSTAT_cat = case_when(
+  GENSTAT == 1 ~ "First",
+  GENSTAT %in% c(2,3) ~ "Second",
+  GENSTAT == 4 ~ "Third+"
+))
+
+# age groups, only those above 65 years old
+census <- census %>% mutate(AGEGRP_cat = case_when(
+  AGEGRP == 17 ~ "65 to 69 years",
+  AGEGRP == 18 ~ "70 to 74 years",
+  AGEGRP == 19 ~ "75 to 79 years",
+  AGEGRP == 20 ~ "80 to 84 years",
+  AGEGRP == 21 ~ "85 years and over"
+))
+
+# Marital status
+census <- census %>% mutate(MarStH_cat = case_when(
+  MarStH == 1 ~ "Never married",
+  MarStH == 2 ~ "Married",
+  MarStH == 3 ~ "Common law",
+  MarStH > 3 ~ "Seperated/divorce/widow"
+))
+
+```
+
+Income variables of interest is MrkInc, meaning everything but government transfers. 
+The missing are coded as numbers, where 8888888 is not applicable, 99999999 is not available.
+
+
+```{r}
+# Market income cleaned
+census <- census %>% mutate(MrkInc_c = case_when(
+  MrkInc == 88888888 ~ NA_real_,
+  MrkInc == 99999999 ~ NA_real_,
+  TRUE ~ MrkInc
+))
+
+
+```
+
+## Descriptive statistics
+
+### Table 1: descriptive
+
+Table 1: the description of the sample by key variables and median market incomes. 
+```{r}
+# defining analytic sample
+# selecting variables of interest and limiting to above 65 years olds, excluding missing
+census_AS <- census %>% select(Sex_cat, VisMin_cat, GENSTAT_cat, MrkInc_c, WEIGHT, MarStH_cat, AGEGRP_cat) %>%
+  na.omit()
+
+descrip_tab <- census_AS %>% mutate(across(c(where(is.character)), ~ as_factor(.))) %>%
+  pivot_longer(-c(MrkInc_c,WEIGHT),names_to = "Variable",values_to = "level") %>%
+  as_survey_design(ids = 1, weights = WEIGHT) %>%
+  group_by(Variable, level) %>% 
+  summarize(n=n(),
+            prop_w = round(survey_mean(vartype = "ci")*100,1),
+            median_MrkInc = survey_median(MrkInc_c,vartype = "se", na.rm = TRUE)) %>%
+  mutate(`Weighted Percentage` = paste0(prop_w," (",format(prop_w_low,1),",",prop_w_upp,")"),
+         median_MrkInc = sprintf("$ %.0f", median_MrkInc)) %>% 
+  arrange(Variable)
+
+kable(descrip_tab %>% ungroup() %>% select(level,n, `Weighted Percentage`, median_MrkInc),
+      col.names = c("", "n", "Weighted %", "Median market income"),
+  caption = "Table 1 Descriptive statistics",
+  booktabs = FALSE, linesep = "", longtable = FALSE
+  ) %>%
+  kable_styling(latex_options = c("repeat_header",font_size=12)) %>%
+  footnote(general = c("Data from census 2016 (PUMF), those 65 years old and above"))  %>%
+  pack_rows(index = c("Age group" = 5, "Generation status" = 3, "Marital status" = 4,
+                      "Sex" = 2,"Visible minority" = 8), indent = TRUE)
+```
+
+
+### Figure 1: Income by gender and visible minority group
+
+```{r}
+
+census_AS %>% group_by(Sex_cat,VisMin_cat) %>% summarize(mean_se(MrkInc_c)) %>%
+  ggplot(aes(x = VisMin_cat, y = y, group = Sex_cat, fill = Sex_cat)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(position=position_dodge(.9),width=.25, aes(ymax=ymax, ymin=ymin),alpha=0.3) +
+  theme_minimal() + 
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = "Market based income by gender and visible minority group",
+       caption = "Census 2016 (PUMF), Above 65 years old",
+       y = "Market income ($)",
+       x = "Visible minoirity group",
+       fill = "Sex")
+  
+```
+
+
+### Regression results 1
+
+The differences in market income by visible minority groups and sex, adjusted for marital status, generation status, and age groups.
+
+```{r}
+
+# set white as the reference group 
+census_AS <- census_AS %>% mutate(VisMin_cat = fct_relevel(VisMin_cat,"White"))
+
+inc_model <- lm(MrkInc_c ~ VisMin_cat * Sex_cat + GENSTAT_cat + MarStH_cat + AGEGRP_cat,
+                data = census_AS, weights = WEIGHT)
+
+modelsummary(inc_model, statistic = "conf.int")
+```
+
